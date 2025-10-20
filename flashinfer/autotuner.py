@@ -254,6 +254,7 @@ def autotune(tune_mode: bool = True):
     autotune_enabled = tune_mode and not old_mode
     if autotune_enabled:
         logger.info("[Autotuner]: Autotuning process starts ...")
+        logger.info("[Autotuner]: Hello check my flashinfer ...")
     try:
         yield
     finally:
