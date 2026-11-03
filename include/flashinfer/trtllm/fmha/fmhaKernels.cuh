@@ -81,13 +81,19 @@ class TllmGenFmhaKernel {
  public:
   static constexpr int kDynamicNumTokensPerPageThreshold = 128;
   static constexpr int kDynamicNumTokensPerPageKernelKey = 128;
-  // Waves of CTAs for multi-CTA KV when one wave gives at most 2 splits. Keep <= 4: the separate
+  // Waves of CTAs for multi-CTA KV when one wave gives few splits. Keep <= 4: the separate
   // reduction kernel needs base CTAs <= 2 x SMs (runFmhaReduction in fmhaReduction.cu).
   static constexpr int kMaxNumWavesForKvSplit = 4;
   static_assert(kMaxNumWavesForKvSplit >= 1 && kMaxNumWavesForKvSplit <= 4);
   // Max KV splits per CGA cluster, and the per-CTA KV length up to which clamping to it pays off.
   static constexpr int kMaxCgaSmemReductionCtasPerSeqKv = 16;
   static constexpr int kMaxSeqLenKvPerCtaForCgaClamp = 4096;
+  // With the multi-wave flag, one-wave splits of 3..15 are raised to up to this many (within the
+  // wave limit), the largest CGA cluster; shorter CTAs can balance long mixed-length KV better.
+  static constexpr int kMaxExtendedKvSplits = 16;
+  // Raised splits are kept only while the estimated attention window per split (from
+  // max_seq_len or the window size) is at least this many tokens; this filters short windows.
+  static constexpr int kMinKvTokensPerExtendedSplit = 4096;
 
   // The parameters for launching the kernel.
   // maxNumCtasQ, maxNumCtasKv, numCtasX, numCtasY, numCtasZ, clusterDimX
@@ -399,10 +405,10 @@ class TllmGenFmhaKernel {
   // start here
   void run(RunnerParams const& params) const {
     // Opt-in: FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT=1 lets the KV split use up to 4 waves.
-    // Enable it for long contexts, decode batches near the SM count, and CUDA graphs captured with
-    // a large max_seq_len. The split only sees max_seq_len, so short or similar KV lengths can be
-    // slower. Try it first; if it cannot launch, select again from a fresh state with the one-wave
-    // rule (the stock path).
+    // Enable it for long contexts (including small decode batches), decode batches near the SM
+    // count, and CUDA graphs captured with a large max_seq_len. The split only sees max_seq_len, so
+    // short or similar KV lengths can be slower. Try it first; if it cannot launch, select again
+    // from a fresh state with the one-wave rule (the stock path).
     static bool const enabled = getBoolEnv("FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT");
     bool const allowMultiWaveKvSplit = enabled && params.mMultiCtasKvScratchBytes > 0;
     if (!allowMultiWaveKvSplit || !tryRun(params, /*allowMultiWaveKvSplit=*/true)) {
@@ -770,20 +776,41 @@ class TllmGenFmhaKernel {
         }
       }
       // Compute numCtasPerSeqKv. One wave leaves SMs idle when it gives only 1-2 splits, so use
-      // more waves: shorter CTAs also balance mixed KV lengths. Not for MLA (own rules). Base CTAs
-      // must not exceed the counters the launcher allocates: round_up(max(B x Hq, SMs), 8).
+      // more waves; with few splits (3..15) and a long window, more and shorter CTAs also balance
+      // mixed KV lengths. Not for MLA (own rules). Base CTAs must not exceed the counters the
+      // launcher allocates: round_up(max(B x Hq, SMs), 8).
       int64_t const baseNumCtas = static_cast<int64_t>(numCtasX) * numCtasY * numCtasZ;
       int64_t const oneWaveSplits = params.mMultiProcessorCount / baseNumCtas;
       int64_t const numCounters = std::max<int64_t>(
           static_cast<int64_t>(params.mBatchSize) * params.mNumHeadsQ, params.mMultiProcessorCount);
-      bool const multiWave = allowMultiWaveKvSplit && oneWaveSplits <= 2 &&
+      bool const extendedRange = oneWaveSplits > 2 && oneWaveSplits < kMaxExtendedKvSplits;
+      bool const multiWave = allowMultiWaveKvSplit && (oneWaveSplits <= 2 || extendedRange) &&
                              !isMlaGenKernel(params) && baseNumCtas <= (numCounters + 7) / 8 * 8;
       int64_t const numWaves = multiWave ? kMaxNumWavesForKvSplit : 1;
       int32_t const oneWaveNumCtasPerSeqKv = static_cast<int32_t>(
           std::min<int64_t>(tunedMaxNumCtasPerSeqKv, std::max<int64_t>(1, oneWaveSplits)));
-      int64_t const multiWaveNumCtasPerSeqKv = std::min<int64_t>(
+      int64_t multiWaveNumCtasPerSeqKv = std::min<int64_t>(
           tunedMaxNumCtasPerSeqKv,
           std::max<int64_t>(1, numWaves * params.mMultiProcessorCount / baseNumCtas));
+      if (multiWave && extendedRange && multiWaveNumCtasPerSeqKv > oneWaveNumCtasPerSeqKv) {
+        // Largest split <= kMaxExtendedKvSplits within a budget of 2..4 waves. Truncating a larger
+        // split to the cap can leave a nearly empty last wave, which costs a full wave of time when
+        // the KV lengths are similar.
+        int64_t splits = oneWaveNumCtasPerSeqKv;
+        for (int64_t waves = 2; waves <= kMaxNumWavesForKvSplit; ++waves) {
+          int64_t const waveSplits = std::min<int64_t>(
+              tunedMaxNumCtasPerSeqKv, waves * params.mMultiProcessorCount / baseNumCtas);
+          if (waveSplits <= kMaxExtendedKvSplits) {
+            splits = std::max(splits, waveSplits);
+          }
+        }
+        if (splits == oneWaveNumCtasPerSeqKv ||
+            flashinfer::ceil_div(static_cast<int64_t>(maxAttentionWindow), splits) <
+                kMinKvTokensPerExtendedSplit) {
+          splits = oneWaveNumCtasPerSeqKv;
+        }
+        multiWaveNumCtasPerSeqKv = splits;
+      }
       // The grid must fit in int32.
       ctaLaunchParams.mMultiWaveKvSplit = multiWaveNumCtasPerSeqKv != oneWaveNumCtasPerSeqKv &&
                                           multiWaveNumCtasPerSeqKv * baseNumCtas <= INT32_MAX;

@@ -2115,9 +2115,12 @@ def test_trtllm_batch_decode_spec(
 
 
 # Multi-wave KV split (opt-in): with FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT=1, when one wave
-# of CTAs gives at most 2 KV splits, trtllm-gen uses up to 4 waves (fmhaKernels.cuh). Unset keeps
-# the stock one-wave split. The 32/2-head cases have base CTAs = 2 x batch (one Q CTA per
-# request), so one-wave splits are SMs // (2 x batch).
+# of CTAs gives at most 2 KV splits, trtllm-gen uses up to 4 waves (fmhaKernels.cuh). One-wave
+# splits of 3..15 are also raised to the largest split <= 16 within a budget of 2..4 waves, while
+# the window per split estimated from max_seq_len stays >= 4096 tokens. Unset keeps the stock
+# one-wave split. The
+# 32/2-head cases have base CTAs = 2 x batch (one Q CTA per request), so one-wave splits are
+# SMs // (2 x batch).
 MULTI_WAVE_KV_SPLIT_ENV = "FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT"
 _MULTI_WAVE_SENTINEL = 0x5A
 
@@ -2245,6 +2248,21 @@ def _multi_wave_scratch_bytes(sm_count, total_ctas, step_q, head_dim_per_cta_v):
     return stats_bytes + partial_o_bytes
 
 
+def _extended_splits(m: int, base: int) -> int:
+    """Raised split for a long-window shape with one-wave split m // base in 3..15.
+
+    The largest k * m // base (k = 2..4) that is <= 16, else the one-wave split. The planner's
+    tunedMax bound and window check are left out; they do not bind for the cases that use this.
+    """
+    return max([m // base] + [k * m // base for k in (2, 3, 4) if k * m // base <= 16])
+
+
+def _batch_for_one_wave(m: int, lo: int, hi: int, largest: bool = False):
+    """A batch whose one-wave split m // (2 x batch) is in [lo, hi] (smallest or largest), or None."""
+    batches = [b for b in range(1, m + 1) if lo <= m // (2 * b) <= hi]
+    return (max(batches) if largest else min(batches)) if batches else None
+
+
 def _multi_wave_cases(m: int) -> dict:
     """Decode cases for SM count m. expect: what the opt-in run does versus the default run.
 
@@ -2279,9 +2297,68 @@ def _multi_wave_cases(m: int) -> dict:
     add("head512-base_2x_sms", "engaged", m // 2, **head512)
     add("base_2x_sms", "engaged", m, max_kv_len=2048)
     add("base_over_2x_sms", "unchanged", m + 1, max_kv_len=2048)  # 4 waves give 1 split
-    # One wave gives 4 splits; and short KV that binds tunedMax with tile-search probes.
+    # One wave gives 4 splits, but 8192 KV is too short to raise (16 x 4096 tokens); and short KV
+    # that binds tunedMax with tile-search probes.
     add("parity", "unchanged", m // 8)
     add("parity_tile_search", "unchanged", 4, q_len=4, max_kv_len=1024)
+    # One wave gives 3..15 splits: a long window is raised to the largest split <= 16 within 2..4
+    # waves. The window per split, ceil(max_kv_len / split), must be >= 4096: 4095 x split + 1 is
+    # the shortest accepted length. One-wave splits of 9..15 (two waves exceed 16), a sliding window
+    # and one-wave splits >= 16 stay stock. Engaged q_len 1 cases check the exact CTA count.
+    long_kv = 16 * 4096
+    one_wave_4 = _batch_for_one_wave(m, 4, 4)
+    split_4 = _extended_splits(m, 2 * one_wave_4) if one_wave_4 else 0
+    one_wave_3 = _batch_for_one_wave(m, 3, 3)
+    add(
+        "extended_one_wave_3",
+        "engaged",
+        one_wave_3,
+        max_kv_len=long_kv,
+        splits=_extended_splits(m, 2 * one_wave_3) if one_wave_3 else 0,
+    )
+    add(
+        "extended_one_wave_4", "engaged", one_wave_4, max_kv_len=long_kv, splits=split_4
+    )
+    add("extended_one_wave_4-q6", "engaged", one_wave_4, 6, max_kv_len=long_kv)
+    add(
+        "extended_one_wave_4-bf16q",
+        "engaged",
+        one_wave_4,
+        q_dtype="bf16",
+        max_kv_len=long_kv,
+    )
+    add("extended_one_wave_4-lse", "engaged", one_wave_4, max_kv_len=long_kv, lse=True)
+    one_wave_5 = _batch_for_one_wave(m, 5, 5)
+    add(
+        "extended_one_wave_5",
+        "engaged",
+        one_wave_5,
+        max_kv_len=long_kv,
+        splits=_extended_splits(m, 2 * one_wave_5) if one_wave_5 else 0,
+    )
+    add(
+        "extended_one_wave_9_15",
+        "unchanged",
+        _batch_for_one_wave(m, 9, 15, largest=True),
+        max_kv_len=long_kv,
+    )
+    add(
+        "extended_kv_min",
+        "engaged",
+        one_wave_4,
+        max_kv_len=4095 * split_4 + 1,
+        splits=split_4,
+    )
+    add("extended_kv_too_short", "unchanged", one_wave_4, max_kv_len=4095 * split_4)
+    add(
+        "extended_window", "unchanged", one_wave_4, max_kv_len=long_kv, window_left=1023
+    )
+    add(
+        "extended_one_wave_16",
+        "unchanged",
+        _batch_for_one_wave(m, 16, 31, largest=True),
+        max_kv_len=long_kv,
+    )
     # Capacity: q_len 6, bf16, keepsMmaAb Q128 (stepQ 128, headDimPerCtaV 128). One wave gives
     # 1 split, so stock writes no scratch. With LSE, the workspace starts 8 bytes past a 16-byte
     # boundary and the launcher pads 8 bytes before the softmax stats.
@@ -2324,6 +2401,17 @@ def _multi_wave_cases(m: int) -> dict:
         batch_size,
         workspace_bytes=need - 1,
     )
+    # Capacity of a raised split (same swapsMmaAb Q16 cubin) of the one-wave-4 shape.
+    batch_size = one_wave_4
+    need = _multi_wave_scratch_bytes(m, split_4 * 2 * (batch_size or 0), 16, 128)
+    for short in (False, True):
+        add(
+            f"extended_capacity_{'one_byte_short' if short else 'exact'}",
+            "unchanged" if short else "engaged",
+            batch_size,
+            max_kv_len=long_kv,
+            workspace_bytes=need - int(short),
+        )
     return cases
 
 
@@ -2363,7 +2451,7 @@ def _multi_wave_worker(cases: dict, out_path: str) -> None:
         result = _multi_wave_decode(
             inp, workspace_buffer, window_left=cfg["window_left"], return_lse=cfg["lse"]
         )
-        output = result[0] if cfg["lse"] else result
+        output, lse = result if cfg["lse"] else (result, None)
         torch.cuda.synchronize()
         checks = {"tail": _untouched(storage[cfg["misalign"] + num_bytes :])}
         if "scratch_start" in cfg:
@@ -2373,7 +2461,7 @@ def _multi_wave_worker(cases: dict, out_path: str) -> None:
                 max(0, start - TRTLLM_GEN_WORKSPACE_CHECK_BYTES) : start
             ]
             checks["lse_guard"] = not cfg["lse"] or _untouched(guard)
-        results[case] = (output.cpu(), checks)
+        results[case] = (output.cpu(), None if lse is None else lse.cpu(), checks)
         del inp, storage, workspace_buffer, result
     torch.save(results, out_path)
 
@@ -2414,9 +2502,11 @@ def multi_wave_runs(tmp_path_factory):
     # The env is read once per process: one subprocess per setting runs every case.
     sm_count = _multi_wave_sm_count()
     cases = _multi_wave_cases(sm_count)
+    # A case without a batch for this SM count is skipped by the test, not run.
+    runnable = {name: cfg for name, cfg in cases.items() if cfg["batch_size"]}
     out_dir = tmp_path_factory.mktemp("multi_wave")
     runs = {
-        opt_in: _run_multi_wave_worker(cases, str(out_dir / f"{opt_in}.pt"), opt_in)
+        opt_in: _run_multi_wave_worker(runnable, str(out_dir / f"{opt_in}.pt"), opt_in)
         for opt_in in (False, True)
     }
     return sm_count, cases, runs
@@ -2426,10 +2516,12 @@ def multi_wave_runs(tmp_path_factory):
 def test_trtllm_batch_decode_multi_wave_kv_split(case: str, multi_wave_runs) -> None:
     sm_count, cases, runs = multi_wave_runs
     cfg = cases[case]
-    output, checks, name, mode, num_ctas = runs[True][case]
-    stock_output, stock_checks, stock_name, stock_mode, stock_num_ctas = runs[False][
-        case
-    ]
+    if not cfg["batch_size"]:
+        pytest.skip(f"no batch gives this case's one-wave split on {sm_count} SMs")
+    output, lse, checks, name, mode, num_ctas = runs[True][case]
+    stock_output, stock_lse, stock_checks, stock_name, stock_mode, stock_num_ctas = (
+        runs[False][case]
+    )
     for run_checks in (checks, stock_checks):
         assert run_checks["tail"], f"{case}: decode wrote past the workspace"
         assert run_checks.get("lse_guard", True), (
@@ -2448,10 +2540,14 @@ def test_trtllm_batch_decode_multi_wave_kv_split(case: str, multi_wave_runs) -> 
         # The split is unchanged, or the multi-wave split did not fit: exactly the stock launch.
         assert (name, mode, num_ctas) == (stock_name, stock_mode, stock_num_ctas)
         assert torch.equal(output, stock_output)
+        if cfg["lse"]:
+            assert torch.equal(lse, stock_lse)
     else:
         # More CTAs than SMs and than the stock launch, with multi-CTA KV on.
         assert num_ctas > max(sm_count, stock_num_ctas), (num_ctas, stock_num_ctas)
         assert mode != _MULTI_CTAS_KV_DISABLED
+        if cfg.get("splits"):
+            assert num_ctas == cfg["splits"] * 2 * cfg["batch_size"], (num_ctas, cfg)
         if "scratch_start" in cfg:
             assert not checks["scratch"], (
                 "multi-wave split did not run at exact capacity"
@@ -2461,6 +2557,11 @@ def test_trtllm_batch_decode_multi_wave_kv_split(case: str, multi_wave_runs) -> 
                 name,
                 mode,
             )
+        if cfg["lse"]:
+            # The fp8-Q LSE has no reliable fp32 reference; the stock split is the reference.
+            assert torch.isfinite(lse).all()
+            atol = 1.2e-2 if cfg["kv_dtype"] == "fp8" else 3e-3
+            torch.testing.assert_close(lse, stock_lse, rtol=1e-3, atol=atol)
 
     # Both runs match an fp32 reference (sdpa_paged_reference on the dequantized Q/K/V).
     inp = _multi_wave_case_inputs(cfg)
